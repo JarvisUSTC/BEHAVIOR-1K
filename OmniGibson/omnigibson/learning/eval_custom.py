@@ -1,59 +1,71 @@
 import csv
-import cv2
-import hydra
+from inspect import getsourcefile
 import json
 import logging
-import numpy as np
-import omnigibson as og
-import omnigibson.utils.transform_utils as T
 import os
+from pathlib import Path
+import shutil
+from signal import SIGINT
+from signal import signal
 import sys
-import torch as th
+import time
 import traceback
+from typing import Any
+
 from av.container import Container
 from av.stream import Stream
-from gello.robots.sim_robot.og_teleop_utils import (
-    augment_rooms,
-    load_available_tasks,
-    generate_robot_config,
-    get_task_relevant_room_types,
-)
+import cv2
 from gello.robots.sim_robot.og_teleop_cfg import DISABLED_TRANSITION_RULES
+from gello.robots.sim_robot.og_teleop_utils import augment_rooms
+from gello.robots.sim_robot.og_teleop_utils import generate_robot_config
+from gello.robots.sim_robot.og_teleop_utils import get_task_relevant_room_types
+from gello.robots.sim_robot.og_teleop_utils import load_available_tasks
+import hydra
 from hydra.utils import instantiate
-from inspect import getsourcefile
-from omegaconf import DictConfig, OmegaConf
+import numpy as np
+from omegaconf import DictConfig
+from omegaconf import OmegaConf
+import omnigibson as og
 from omnigibson.envs.env_wrapper import EnvironmentWrapper
+from omnigibson.learning.pose_perturbator import PosePerturbator
 from omnigibson.learning.utils.config_utils import register_omegaconf_resolvers
-from omnigibson.learning.utils.eval_utils import (
-    ROBOT_CAMERA_NAMES,
-    PROPRIOCEPTION_INDICES,
-    generate_basic_environment_config,
-    flatten_obs_dict,
-    TASK_NAMES_TO_INDICES,
-)
-from omnigibson.learning.utils.obs_utils import (
-    create_video_writer,
-    write_video,
-)
-from omnigibson.macros import gm, create_module_macros
-from omnigibson.metrics import MetricBase, AgentMetric, TaskMetric
+from omnigibson.learning.utils.eval_utils import HEAD_RESOLUTION
+from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
+from omnigibson.learning.utils.eval_utils import TASK_NAMES_TO_INDICES
+from omnigibson.learning.utils.eval_utils import WRIST_RESOLUTION
+from omnigibson.learning.utils.eval_utils import flatten_obs_dict
+from omnigibson.learning.utils.eval_utils import generate_basic_environment_config
+from omnigibson.learning.utils.obs_utils import create_video_writer
+from omnigibson.learning.utils.obs_utils import write_video
+from omnigibson.macros import create_module_macros
+from omnigibson.macros import gm
+from omnigibson.metrics import AgentMetric
+from omnigibson.metrics import MetricBase
+from omnigibson.metrics import TaskMetric
 from omnigibson.robots import BaseRobot
 from omnigibson.utils.asset_utils import get_task_instance_path
 from omnigibson.utils.python_utils import recursively_convert_to_torch
-from pathlib import Path
-from signal import signal, SIGINT
-from typing import Any, Tuple, List, Optional, Callable, Dict
+import omnigibson.utils.transform_utils as T
+import torch as th
 
 m = create_module_macros(module_path=__file__)
 m.NUM_EVAL_EPISODES = 1
-m.NUM_TRAIN_INSTANCES = 200
 m.NUM_EVAL_INSTANCES = 10
+m.NUM_TRAIN_INSTANCES = 200
 
 
 # set global variables to boost performance
 gm.ENABLE_FLATCACHE = True
 gm.USE_GPU_DYNAMICS = False
 gm.ENABLE_TRANSITION_RULES = True
+
+# rollout video
+ROLLOUT_CAMERA_NAMES = [
+    "head",
+    "left_wrist",
+    "right_wrist",
+]
 
 # create module logger
 logger = logging.getLogger("evaluator")
@@ -87,6 +99,13 @@ class Evaluator:
         # manually reset environment episode number
         self.env._current_episode = 0
         self._video_writer = None
+        self._rollout_video_writers = None
+
+        if self.cfg.perturb_pose:
+            self._pose_perturbator = PosePerturbator(logger)
+            np.random.seed(self.cfg.perturb_pose_seed)
+
+        logger.info(f"{self.cfg=}")
 
     def load_env(self, env_wrapper: DictConfig) -> EnvironmentWrapper:
         """
@@ -108,7 +127,7 @@ class Evaluator:
             "left_eef_displacement": [],
             "right_eef_displacement": [],
         }
-        with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl"), "r") as f:
+        with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl")) as f:
             episodes = [json.loads(line) for line in f]
         for episode in episodes:
             if episode["episode_index"] // 1e4 == task_idx:
@@ -174,13 +193,13 @@ class Evaluator:
         logger.info("")
         return policy
 
-    def load_metrics(self) -> List[MetricBase]:
+    def load_metrics(self) -> list[MetricBase]:
         """
         Load agent and task metrics.
         """
         return [AgentMetric(self.human_stats), TaskMetric(self.human_stats)]
 
-    def step(self) -> Tuple[bool, bool]:
+    def step(self) -> tuple[bool, bool, dict]:
         """
         Performs a single step of the task by executing the policy, interacting with the environment,
         processing observations, updating metrics, and tracking trial success.
@@ -208,114 +227,20 @@ class Evaluator:
 
         if terminated or truncated:
             self.n_trials += 1
-            if info["done"]["success"]:
-                self.n_success_trials += 1
 
         for metric in self.metrics:
             metric.step_callback(self.env)
-        return terminated, truncated
-
-    def run_vla_episode(
-        self,
-        prompt: Optional[str] = None,
-        max_steps: Optional[int] = None,
-        return_preprocessed: bool = False,
-        subtask_done_fn: Optional[Callable[[Dict, int], bool]] = None,
-    ) -> dict:
-        """
-        Run a single episode of VLA–environment interaction and return the final observation.
-
-        This keeps the environment–task binding from the config, but allows a custom prompt
-        to be passed to the policy on every step. The prompt is attached to the observation
-        under the key \"prompt\" before being sent to the policy. On the VLA side, this prompt
-        can override the default task prompt if the policy / wrapper supports it.
-
-        Args:
-            prompt: Optional text prompt to attach to every policy call. If None, no extra
-                prompt field is added and the policy uses its own default.
-            max_steps: Optional hard cap on the number of environment steps. If None, the
-                rollout only stops when the environment terminates or is truncated.
-            return_preprocessed: If True, return the final preprocessed observation
-                (same format as self.obs). If False, return the final raw environment
-                observation from env.step().
-
-        Returns:
-            dict:
-                - obs: 最后一步的观测（raw 或 preprocessed，取决于 return_preprocessed）
-                - terminated: High-level task 是否终止（环境 terminated）
-                - truncated: High-level task 是否被截断（时间等原因）
-                - reached_max_steps: 是否因为达到 max_steps 而停止
-                - subtask_done: 是否因为外部判定“子任务完成”而停止
-
-        Note:
-            This method does NOT reset the environment or policy. It assumes
-            the caller has already put the environment into the desired initial
-            state (e.g., via reset() / load_task_instance()). This allows you
-            to structure loops like VLM -> [VLA <-> Env] -> VLM without
-            unintentionally restarting the task.
-        """
-        done = False
-        step_count = 0
-        last_raw_obs = None
-
-        terminated = False
-        truncated = False
-        reached_max_steps = False
-        subtask_done = False
-
-        while not done:
-            # Optionally attach a custom prompt for this rollout
-            obs_for_policy = self.obs
-            if prompt is not None:
-                obs_for_policy = dict(obs_for_policy)
-                obs_for_policy["prompt"] = prompt
-
-            # Query the policy (which may talk to a remote VLA server)
-            self.robot_action = self.policy.forward(obs=obs_for_policy)
-
-            # Step the environment
-            raw_obs, _, terminated, truncated, _ = self.env.step(self.robot_action, n_render_iterations=1)
-            last_raw_obs = raw_obs
-            # Update internal preprocessed observation for the next policy call
-            self.obs = self._preprocess_obs(raw_obs)
-
-            step_count += 1
-            if terminated or truncated:
-                done = True
-
-            # 3) 通过外部回调判断“子任务是否完成”
-            # 回调拿到当前 raw obs 和已经走过的步数，由 VLMAgent/VLA 自己决定是否停在这一子任务上
-            if (not done) and subtask_done_fn is not None:
-                try:
-                    if subtask_done_fn(raw_obs, step_count):
-                        subtask_done = True
-                        done = True
-                except Exception as e:
-                    logger.error(f"Error in subtask_done_fn: {e}")
-
-            if max_steps is not None and step_count >= max_steps:
-                reached_max_steps = True
-                done = True
-
-        final_obs = self.obs if return_preprocessed else last_raw_obs
-        return {
-            "obs": final_obs,
-            "terminated": terminated,
-            "truncated": truncated,
-            "reached_max_steps": reached_max_steps,
-            "subtask_done": subtask_done,
-            "steps": step_count,
-        }
+        return terminated, truncated, info
 
     @property
-    def video_writer(self) -> Tuple[Container, Stream]:
+    def video_writer(self) -> tuple[Container, Stream]:
         """
         Returns the video writer for the current evaluation step.
         """
         return self._video_writer
 
     @video_writer.setter
-    def video_writer(self, video_writer: Tuple[Container, Stream]) -> None:
+    def video_writer(self, video_writer: tuple[Container, Stream]) -> None:
         if self._video_writer is not None:
             (container, stream) = self._video_writer
             # Flush any remaining packets
@@ -324,6 +249,25 @@ class Evaluator:
             # Close the container
             container.close()
         self._video_writer = video_writer
+
+    @property
+    def rollout_video_writers(self) -> dict[str, tuple[Container, Stream]]:
+        """
+        Returns the video writer for the current rollout.
+        """
+        return self._rollout_video_writers
+
+    @rollout_video_writers.setter
+    def rollout_video_writers(self, rollout_video_writers: dict[str, tuple[Container, Stream]]) -> None:
+        if self._rollout_video_writers is not None:
+            for camera_name in ROLLOUT_CAMERA_NAMES:
+                (container, stream) = self._rollout_video_writers[camera_name]
+                # Flush any remaining packets
+                for packet in stream.encode():
+                    container.mux(packet)
+                # Close the container
+                container.close()
+        self._rollout_video_writers = rollout_video_writers
 
     def load_task_instance(self, instance_id: int, test_hidden: bool = False) -> None:
         """
@@ -352,7 +296,7 @@ class Evaluator:
                 get_task_instance_path(scene_model),
                 f"json/{scene_model}_task_{self.env.task.activity_name}_instances/{tro_filename}-tro_state.json",
             )
-        with open(tro_file_path, "r") as f:
+        with open(tro_file_path) as f:
             tro_state = recursively_convert_to_torch(json.load(f))
         for tro_key, tro_state in tro_state.items():
             if tro_key == "robot_poses":
@@ -360,6 +304,14 @@ class Evaluator:
                 robot_pos = presampled_robot_poses[self.robot.model_name][0]["position"]
                 robot_quat = presampled_robot_poses[self.robot.model_name][0]["orientation"]
                 self.robot.set_position_orientation(robot_pos, robot_quat)
+
+                if self.cfg.perturb_pose:
+                    perturbed_pos, perturbed_quat = self._pose_perturbator.perturb_robot_root_pose(
+                        robot_pos, robot_quat
+                    )
+                    presampled_robot_poses[self.robot.model_name][0]["position"] = perturbed_pos
+                    presampled_robot_poses[self.robot.model_name][0]["orientation"] = perturbed_quat
+
                 # Write robot poses to scene metadata
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
             else:
@@ -417,15 +369,15 @@ class Evaluator:
         # concatenate obs
         left_wrist_rgb = cv2.resize(
             self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["left_wrist"] + "::rgb"].numpy(),
-            (224, 224),
+            (56, 56),
         )
         right_wrist_rgb = cv2.resize(
             self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["right_wrist"] + "::rgb"].numpy(),
-            (224, 224),
+            (56, 56),
         )
         head_rgb = cv2.resize(
             self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy(),
-            (448, 448),
+            (112, 112),
         )
         write_video(
             np.expand_dims(np.hstack([np.vstack([left_wrist_rgb, right_wrist_rgb]), head_rgb]), 0),
@@ -433,6 +385,49 @@ class Evaluator:
             batch_size=1,
             mode="rgb",
         )
+
+    def _write_rollout(self) -> None:
+        """
+        Write the current robot observations to rollout video.
+        """
+        # logger.info(f"{self.obs['robot_r1::proprio'].shape=}, dtype={self.obs['robot_r1::proprio'].dtype}")
+        # logger.info(f"{self.robot_action.shape=}, dtype={self.robot_action.dtype}")
+
+        self.rollout_state_action["state"].append(self.obs["robot_r1::proprio"].cpu().numpy())
+        self.rollout_state_action["action"].append(self.robot_action.cpu().numpy())
+
+        for camera_name in ROLLOUT_CAMERA_NAMES:
+            write_video(
+                self.obs[ROBOT_CAMERA_NAMES["R1Pro"][camera_name] + "::rgb"].numpy()[None, ...],
+                video_writer=self.rollout_video_writers[camera_name],
+                batch_size=1,
+                mode="rgb",
+            )
+
+    def success_callback(self, success: bool) -> None:
+        """
+        Callback function to be called when the task is completed successfully.
+        """
+        # self.video_writer = None
+        # self.rollout_video_writers = None
+
+        if success:
+            self.n_success_trials += 1
+            sucess_video_name = self.cur_video_name.replace(".mp4", "_success.mp4")
+            try:
+                shutil.move(self.cur_video_name, sucess_video_name)
+            except:
+                logger.warning(f"Failed to move video {self.cur_video_name} to {sucess_video_name}")
+            self.cur_video_name = sucess_video_name
+            if hasattr(self, "rollout_paths"):
+                np.savez_compressed(self.rollout_paths["state_action"], self.rollout_state_action)
+                logger.info(f"Saved rollout data to {self.rollout_paths['state_action']}")
+        elif hasattr(self, "rollout_paths"):
+            for camera_name in ROLLOUT_CAMERA_NAMES:
+                try:
+                    os.remove(self.rollout_paths[camera_name])
+                except:
+                    logger.warning(f"Failed to remove rollout video {self.rollout_paths.get(camera_name)}")
 
     def reset(self) -> None:
         """
@@ -462,6 +457,7 @@ class Evaluator:
         if exc_type is not None:
             traceback.print_exception(exc_type, exc_value, exc_tb)
         self.video_writer = None
+        self.rollout_video_writers = None
         self.env.close()
         og.shutdown()
 
@@ -474,7 +470,7 @@ class Evaluator:
 if __name__ == "__main__":
     register_omegaconf_resolvers()
     # open yaml from task path
-    with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda:0)).parents[0]}/configs", version_base="1.1"):
+    with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda: 0)).parents[0]}/configs", version_base="1.1"):
         config = hydra.compose("base_config.yaml", overrides=sys.argv[1:])
     OmegaConf.resolve(config)
     # set headless mode
@@ -483,18 +479,22 @@ if __name__ == "__main__":
     if config.write_video:
         video_path = Path(config.log_path).expanduser() / "videos"
         video_path.mkdir(parents=True, exist_ok=True)
+    if config.save_rollout:
+        rollout_path = Path(config.log_path).expanduser() / "rollouts"
+        rollout_path.mkdir(parents=True, exist_ok=True)
     assert not (
         config.eval_on_train_instances and config.test_hidden
     ), "Cannot eval on train instances and test hidden instances simultaneously."
     if config.test_hidden:
         logger.info("You are evaluating on hidden test instances! This is for internal use only.")
+
     # get run instances
     if config.eval_on_train_instances:
         logger.info(
             "You are evaluating on training instances, set eval_on_train_instances to False for test instances."
         )
         task_idx = TASK_NAMES_TO_INDICES[config.task.name]
-        with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl"), "r") as f:
+        with open(os.path.join(gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "episodes.jsonl")) as f:
             episodes = [json.loads(line) for line in f]
         instances_to_run = []
         for episode in episodes:
@@ -505,6 +505,7 @@ if __name__ == "__main__":
                 set(range(m.NUM_TRAIN_INSTANCES))
             ), f"eval instance ids must be in range({m.NUM_TRAIN_INSTANCES})"
             instances_to_run = [instances_to_run[i] for i in config.eval_instance_ids]
+
     elif config.test_hidden:
         instances_to_run = (
             config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
@@ -512,10 +513,19 @@ if __name__ == "__main__":
         assert set(instances_to_run).issubset(
             set(range(m.NUM_EVAL_INSTANCES))
         ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
+
     else:
-        instances_to_run = (
-            config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
-        )
+        # parallel evaluator
+        if config.use_parallel_evaluator:
+            instances_to_run = set(range(config.parallel_evaluator_start_idx, config.parallel_evaluator_end_idx))
+            logger.info(
+                f"Using parallel evaluator with start index {config.parallel_evaluator_start_idx} and end index {config.parallel_evaluator_end_idx}"
+            )
+        else:
+            instances_to_run = (
+                config.eval_instance_ids if config.eval_instance_ids is not None else set(range(m.NUM_EVAL_INSTANCES))
+            )
+
         assert set(instances_to_run).issubset(
             set(range(m.NUM_EVAL_INSTANCES))
         ), f"eval instance ids must be in range({m.NUM_EVAL_INSTANCES})"
@@ -523,13 +533,14 @@ if __name__ == "__main__":
         task_instance_csv_path = os.path.join(
             gm.DATA_PATH, "2025-challenge-task-instances", "metadata", "test_instances.csv"
         )
-        with open(task_instance_csv_path, "r") as f:
+        with open(task_instance_csv_path) as f:
             lines = list(csv.reader(f))[1:]
         assert (
             lines[TASK_NAMES_TO_INDICES[config.task.name]][1] == config.task.name
         ), f"Task name from config {config.task.name} does not match task name from csv {lines[TASK_NAMES_TO_INDICES[config.task.name]][1]}"
         test_instances = lines[TASK_NAMES_TO_INDICES[config.task.name]][2].strip().split(",")
         instances_to_run = [int(test_instances[i]) for i in instances_to_run]
+
     # establish metrics
     metrics = {}
     metrics_path = Path(config.log_path).expanduser() / "metrics"
@@ -538,30 +549,66 @@ if __name__ == "__main__":
     with Evaluator(config) as evaluator:
         logger.info("Starting evaluation...")
 
-        for idx in instances_to_run:
+        # NOTE: we change the order of the loops to make diversity
+        for epi in range(m.NUM_EVAL_EPISODES):
             evaluator.reset()
-            evaluator.load_task_instance(idx, test_hidden=config.test_hidden)
-            logger.info(f"Starting task instance {idx} for evaluation...")
-            for epi in range(m.NUM_EVAL_EPISODES):
+            for idx in instances_to_run:
                 evaluator.reset()
+                evaluator.load_task_instance(idx, test_hidden=config.test_hidden)
+                logger.info(f"Starting task instance {idx} / episode {epi} for evaluation...")
+
                 done = False
                 if config.write_video:
-                    video_name = str(video_path) + f"/{config.task.name}_{idx}_{epi}.mp4"
+                    evaluator.cur_video_name = f"{video_path!s}/{config.task.name}_{idx}_{epi}.mp4"
                     evaluator.video_writer = create_video_writer(
-                        fpath=video_name,
-                        resolution=(448, 672),
+                        fpath=evaluator.cur_video_name,
+                        resolution=(112, 168),
                     )
+
+                if config.save_rollout:
+                    rollout_video_writers = {}
+                    rollout_paths = {}
+                    for camera_name in ROLLOUT_CAMERA_NAMES:
+                        rollout_id_path = Path(rollout_path) / f"{int(idx):04d}_{int(epi):04d}"
+                        rollout_id_path.mkdir(parents=True, exist_ok=True)
+                        rollout_paths[camera_name] = str(rollout_id_path / f"{camera_name}.mp4")
+                        rollout_video_writers[camera_name] = create_video_writer(
+                            fpath=rollout_paths[camera_name],
+                            resolution=HEAD_RESOLUTION if camera_name == "head" else WRIST_RESOLUTION,
+                        )
+
+                    evaluator.rollout_video_writers = rollout_video_writers
+                    rollout_paths["state_action"] = str(rollout_id_path / "state_action.npz")
+                    evaluator.rollout_paths = rollout_paths
+                    evaluator.rollout_state_action = {"state": [], "action": []}
+                    logger.info(f"created rollout video writers and saved rollout video to {rollout_id_path}")
+
                 # run metric start callbacks
                 for metric in evaluator.metrics:
                     metric.start_callback(evaluator.env)
+
                 while not done:
-                    terminated, truncated = evaluator.step()
+                    time_start = time.time()
+                    terminated, truncated, info = evaluator.step()
+                    time_step = time.time() - time_start
+
+                    if time_step > 15 * 60:
+                        logger.error(f"Step timeout: {time_step} seconds, terminating evaluation")
+                        exit(1)
+
                     if terminated or truncated:
                         done = True
-                    if config.write_video:
+                    if config.save_rollout:
+                        evaluator._write_rollout()
+                    if config.write_video and evaluator.env._current_step % 20 == 0:
                         evaluator._write_video()
                     if evaluator.env._current_step % 1000 == 0:
                         logger.info(f"Current step: {evaluator.env._current_step}")
+
+                    # callback for end of episode
+                    if terminated or truncated:
+                        evaluator.success_callback(info["done"]["success"])
+
                 # run metric end callbacks
                 for metric in evaluator.metrics:
                     metric.end_callback(evaluator.env)
@@ -577,6 +624,12 @@ if __name__ == "__main__":
                 # reset video writer
                 if config.write_video:
                     evaluator.video_writer = None
-                    logger.info(f"Saved video to {video_name}")
+                    logger.info(f"Saved video to {evaluator.cur_video_name}")
+                # reset rollout video writers
+                if config.save_rollout:
+                    evaluator.rollout_video_writers = None
+                    evaluator.rollout_paths = None
+                    evaluator.rollout_state_action = None
+                    logger.info(f"Saved rollout video to {evaluator.rollout_paths}")
                 else:
                     logger.warning("No observations were recorded.")
