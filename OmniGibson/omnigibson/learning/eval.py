@@ -221,6 +221,7 @@ class Evaluator:
         max_steps: Optional[int] = None,
         return_preprocessed: bool = False,
         subtask_done_fn: Optional[Callable[[Dict, int], bool]] = None,
+        write_video_every_n: int = 5,
     ) -> dict:
         """
         Run a single episode of VLA–environment interaction and return the final observation.
@@ -238,6 +239,7 @@ class Evaluator:
             return_preprocessed: If True, return the final preprocessed observation
                 (same format as self.obs). If False, return the final raw environment
                 observation from env.step().
+            write_video_every_n: 每隔多少步写一帧视频（仅当已设置 video_writer 时生效）。
 
         Returns:
             dict:
@@ -263,6 +265,8 @@ class Evaluator:
         reached_max_steps = False
         subtask_done = False
 
+        raise NotImplementedError
+
         while not done:
             # Optionally attach a custom prompt for this rollout
             obs_for_policy = self.obs
@@ -280,6 +284,9 @@ class Evaluator:
             self.obs = self._preprocess_obs(raw_obs)
 
             step_count += 1
+            # 每 write_video_every_n 步写入一帧视频（仅当外部已设置 video_writer）
+            if self.video_writer is not None and write_video_every_n > 0 and step_count % write_video_every_n == 0:
+                self._write_video()
             if terminated or truncated:
                 done = True
 
@@ -427,6 +434,12 @@ class Evaluator:
             self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy(),
             (448, 448),
         )
+        print('*'*1000)
+        print(left_wrist_rgb.shape)
+        print(right_wrist_rgb.shape)
+        print(head_rgb.shape)
+        print('*'*1000)
+        
         write_video(
             np.expand_dims(np.hstack([np.vstack([left_wrist_rgb, right_wrist_rgb]), head_rgb]), 0),
             video_writer=self.video_writer,
