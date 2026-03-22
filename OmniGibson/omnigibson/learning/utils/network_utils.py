@@ -67,7 +67,7 @@ class WebsocketClientPolicy:
                         logger.info("Health check passed, attempting websocket connection...")
                         break
             except (urllib.error.URLError, OSError):
-                logger.info("Health check failed, waiting for server...")
+                logger.info(f"{health_url}: Health check failed, waiting for server...")
                 time.sleep(5)
 
         # Now attempt websocket connection (rest of the code remains the same)

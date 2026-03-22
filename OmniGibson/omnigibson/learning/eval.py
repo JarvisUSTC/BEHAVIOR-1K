@@ -221,7 +221,7 @@ class Evaluator:
         max_steps: Optional[int] = None,
         return_preprocessed: bool = False,
         subtask_done_fn: Optional[Callable[[Dict, int], bool]] = None,
-        write_video_every_n: int = 5,
+        write_video_every_n: int = 1,
     ) -> dict:
         """
         Run a single episode of VLA–environment interaction and return the final observation.
@@ -248,6 +248,9 @@ class Evaluator:
                 - truncated: High-level task 是否被截断（时间等原因）
                 - reached_max_steps: 是否因为达到 max_steps 而停止
                 - subtask_done: 是否因为外部判定“子任务完成”而停止
+                - task_success: 环境在 terminated/truncated 时给出的整任务是否成功
+                  (info[\"done\"][\"success\"])；若因 max_steps / subtask_done 结束且
+                  环境未终止，则为 None。
 
         Note:
             This method does NOT reset the environment or policy. It assumes
@@ -264,8 +267,9 @@ class Evaluator:
         truncated = False
         reached_max_steps = False
         subtask_done = False
+        task_success = None  # set when env signals terminated/truncated; else unknown
 
-        raise NotImplementedError
+        # raise NotImplementedError
 
         while not done:
             # Optionally attach a custom prompt for this rollout
@@ -278,7 +282,9 @@ class Evaluator:
             self.robot_action = self.policy.forward(obs=obs_for_policy)
 
             # Step the environment
-            raw_obs, _, terminated, truncated, _ = self.env.step(self.robot_action, n_render_iterations=1)
+            raw_obs, _, terminated, truncated, info = self.env.step(
+                self.robot_action, n_render_iterations=1
+            )
             last_raw_obs = raw_obs
             # Update internal preprocessed observation for the next policy call
             self.obs = self._preprocess_obs(raw_obs)
@@ -289,6 +295,12 @@ class Evaluator:
                 self._write_video()
             if terminated or truncated:
                 done = True
+                # BEHAVIOR task success flag (see evaluator.step())
+                done_block = (info or {}).get("done") or {}
+                if "success" in done_block:
+                    task_success = bool(done_block["success"])
+                else:
+                    task_success = None
 
             # 3) 通过外部回调判断“子任务是否完成”
             # 回调拿到当前 raw obs 和已经走过的步数，由 VLMAgent/VLA 自己决定是否停在这一子任务上
@@ -311,6 +323,7 @@ class Evaluator:
             "truncated": truncated,
             "reached_max_steps": reached_max_steps,
             "subtask_done": subtask_done,
+            "task_success": task_success,
             "steps": step_count,
         }
 
@@ -434,11 +447,11 @@ class Evaluator:
             self.obs[ROBOT_CAMERA_NAMES["R1Pro"]["head"] + "::rgb"].numpy(),
             (448, 448),
         )
-        print('*'*1000)
-        print(left_wrist_rgb.shape)
-        print(right_wrist_rgb.shape)
-        print(head_rgb.shape)
-        print('*'*1000)
+        # print('*'*1000)
+        # print(left_wrist_rgb.shape)
+        # print(right_wrist_rgb.shape)
+        # print(head_rgb.shape)
+        # print('*'*1000)
         
         write_video(
             np.expand_dims(np.hstack([np.vstack([left_wrist_rgb, right_wrist_rgb]), head_rgb]), 0),
@@ -487,8 +500,13 @@ class Evaluator:
 if __name__ == "__main__":
     register_omegaconf_resolvers()
     # open yaml from task path
-    with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda:0)).parents[0]}/configs", version_base="1.1"):
-        config = hydra.compose("base_config.yaml", overrides=sys.argv[1:])
+    try:
+        with hydra.initialize_config_dir(f"{Path(getsourcefile(lambda:0)).parents[0]}/configs", version_base="1.1"):
+            config = hydra.compose("base_config.yaml", overrides=sys.argv[1:])
+    except Exception as e:
+        logger.error(f"Failed to parse config overrides: {e}")
+        logger.error("Make sure there are no spaces around the '=' in your command line overrides (e.g. use 'log_path=path/to/log' instead of 'log_path= path/to/log').")
+        sys.exit(1)
     OmegaConf.resolve(config)
     # set headless mode
     gm.HEADLESS = config.headless

@@ -4,6 +4,7 @@ from omnigibson.learning.utils.eval_utils import HEAD_RESOLUTION
 from omnigibson.learning.utils.eval_utils import ROBOT_CAMERA_NAMES
 from omnigibson.learning.utils.eval_utils import WRIST_RESOLUTION
 from omnigibson.utils.ui_utils import create_module_logger
+import omnigibson as og
 
 # Create module logger
 logger = create_module_logger("RGBWrapper")
@@ -20,6 +21,9 @@ class RGBWrapper(EnvironmentWrapper):
         # Note that from eval.py we only set rgb modality, here we include more (depth + seg_instance_id)
         # Here, we change the camera resolution and head camera aperture to match the one we used in data collection
         robot = env.robots[0]
+        # for testing
+        with og.sim.stopped():
+            robot.base_footprint_link.mass = 250.0  # increase base mass to 250kg
         # Update robot sensors:
         for camera_id, camera_name in ROBOT_CAMERA_NAMES["R1Pro"].items():
             sensor_name = camera_name.split("::")[1]
